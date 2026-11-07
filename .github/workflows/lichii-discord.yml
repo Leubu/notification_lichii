@@ -1,0 +1,71 @@
+name: Lichii runs -> Discord
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # toutes les 15 minutes
+  workflow_dispatch:          # permet de le lancer à la main
+
+permissions:
+  contents: write             # pour mémoriser le dernier run vu
+
+concurrency:
+  group: lichii-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chercher les nouveaux runs Lichii
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          REPO: zortos293/Lichii
+          WORKFLOW: release-binaries.yml
+        run: |
+          set -euo pipefail
+          STATE=.lichii-last-run
+          LAST=$(cat "$STATE" 2>/dev/null || echo "")
+
+          RUNS=$(gh api "repos/$REPO/actions/workflows/$WORKFLOW/runs?status=completed&per_page=20" \
+            --jq '[.workflow_runs[] | {id, run_number, conclusion, head_branch, html_url, updated_at}] | sort_by(.id)')
+
+          LATEST=$(echo "$RUNS" | jq -r '.[-1].id // empty')
+          [ -z "$LATEST" ] && { echo "Aucun run trouvé"; exit 0; }
+
+          if [ -z "$LAST" ]; then
+            echo "Première exécution : on mémorise le dernier run sans envoyer de message."
+          else
+            echo "$RUNS" | jq -c --argjson last "$LAST" '.[] | select(.id > $last)' | while read -r run; do
+              ID=$(jq -r .id <<<"$run")
+              COUNT=$(gh api "repos/$REPO/actions/runs/$ID/artifacts" --jq '.total_count')
+              case "$(jq -r .conclusion <<<"$run")" in
+                success) ICON="✅"; COLOR=3066993 ;;
+                failure) ICON="❌"; COLOR=15158332 ;;
+                *)       ICON="⚪"; COLOR=9807270 ;;
+              esac
+              PAYLOAD=$(jq -n --argjson r "$run" --arg icon "$ICON" --argjson color "$COLOR" --arg count "$COUNT" '{
+                username: "Lichii builds",
+                embeds: [{
+                  title: "\($icon) release-binaries #\($r.run_number) : \($r.conclusion)",
+                  url: $r.html_url,
+                  description: "Branche `\($r.head_branch)`\n\($count) artifact(s) à télécharger en bas de la page du run",
+                  color: $color,
+                  timestamp: $r.updated_at
+                }]
+              }')
+              curl -fsS -H "Content-Type: application/json" -d "$PAYLOAD" "$WEBHOOK"
+              sleep 1
+            done
+          fi
+
+          if [ "$LATEST" != "$LAST" ]; then
+            echo "$LATEST" > "$STATE"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$STATE"
+            git commit -m "Dernier run Lichii vu : $LATEST"
+            git push
+          fi
